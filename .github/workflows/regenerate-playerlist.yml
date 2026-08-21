@@ -1,0 +1,119 @@
+name: Regenerate SteamRep player list
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "convert_steamrep_to_tf2bd.py"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: regenerate-steamrep-playerlist
+  cancel-in-progress: true
+
+jobs:
+  regenerate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Generate player list
+        run: |
+          python3 convert_steamrep_to_tf2bd.py \
+            SteamRep_Profiles_BannedCaution_2024_csv.zip \
+            playerlist.steamrep.json
+
+      - name: Validate generated file
+        run: |
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          path = Path("playerlist.steamrep.json")
+
+          with path.open("r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          assert data["$schema"].endswith("/schemas/v3/playerlist.schema.json")
+          assert isinstance(data["players"], list)
+          assert data["players"], "Generated player list is empty"
+
+          # Matches the SteamID3 form accepted by TF2 Bot Detector.
+          steamid_re = re.compile(r"^\[U:1:\d+(?::\d+)?\]$")
+          seen = set()
+
+          for index, player in enumerate(data["players"]):
+              sid = player.get("steamid")
+
+              assert isinstance(sid, str), (
+                  f"player {index}: steamid is not a string: {sid!r}"
+              )
+              assert steamid_re.fullmatch(sid), (
+                  f"player {index}: invalid SteamID3: {sid!r}"
+              )
+              assert player.get("attributes") == ["suspicious"], (
+                  f"player {index}: unexpected attributes"
+              )
+              assert sid not in seen, (
+                  f"player {index}: duplicate SteamID: {sid}"
+              )
+
+              seen.add(sid)
+
+          print(f"Validated {len(data['players']):,} entries")
+          PY
+
+      - name: Check generated diff
+        id: diff
+        run: |
+          if git diff --quiet -- playerlist.steamrep.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "playerlist.steamrep.json is already current"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git diff --stat -- playerlist.steamrep.json
+          fi
+
+      - name: Commit generated file
+        if: steps.diff.outputs.changed == 'true'
+        id: commit
+        run: |
+          BRANCH="automation/regenerate-steamrep-${GITHUB_RUN_ID}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git switch -c "$BRANCH"
+          git add -- playerlist.steamrep.json
+          git commit -m "chore: regenerate SteamRep player list"
+          git push --set-upstream origin "$BRANCH"
+
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Open pull request
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.commit.outputs.branch }}
+        run: |
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "chore: regenerate SteamRep player list" \
+            --body "Regenerates \`playerlist.steamrep.json\` from the frozen SteamRep archive using the current \`convert_steamrep_to_tf2bd.py\` converter.
+
+          Generated and validated automatically by GitHub Actions."
